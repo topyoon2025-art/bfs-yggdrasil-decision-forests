@@ -5332,7 +5332,7 @@ absl::Status GrowTreeLocalBFS(
         cudaMemcpy(d_flat_projection_weights, flat_proj_weights.data(), flat_proj_weights.size() * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_node_row_off, node_row_offsets.data(), (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
 
-        int selected_features_count = 1;
+        int selected_features_count = 2;
         ColumnAddProjectionKernel_SRDW_1_NP_func(d_flat_data,
                                                  d_selected_examples,
                                                  d_col_add_projected,

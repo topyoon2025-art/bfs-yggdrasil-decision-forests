@@ -1035,7 +1035,7 @@ void SampleGuidedProjection(
   }
 
   if (num_selected_features == 0) {
-    num_selected_features = 1;
+    num_selected_features = 2;
   }
   DCHECK_GT(num_selected_features, 0);
 
