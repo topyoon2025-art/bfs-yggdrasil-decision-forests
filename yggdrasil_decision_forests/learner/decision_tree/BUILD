@@ -1,5 +1,8 @@
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
 
+#ADDED BY JY
+load("@rules_cuda//cuda:defs.bzl", "cuda_library")
+
 # TODO: Enbable CUDA build in OSS
 # load("@rules_cuda//cuda:defs.bzl", "cuda_library", "requires_cuda")
 
@@ -13,19 +16,50 @@ package(
 # Libraries
 # =========================================================
 
+cuda_library(
+    name = "oblique_apply_projection",
+    srcs = ["oblique_apply_projection.cu"],
+    hdrs = ["oblique_apply_projection.cuh"],
+    includes = ["."],
+    deps = [
+        "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/status:status",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/types:span",
+        "//yggdrasil_decision_forests/dataset:vertical_dataset",
+    ],
+   copts = [
+        "-std=c++17",
+        "-Xcompiler",
+        "-DGOOGLE_PROTOBUF_NO_ARENA=1",
+        "-Wno-deprecated-gpu-targets",
+    ], 
+    #+ select({
+    #    ":profile_on_1": ["-DPROFILE1"],   # added only when --define=profile=true
+    #    "//conditions:default": [],
+    #}),
+    visibility = ["//visibility:public"],
+)
+
 cc_library_ydf(
     name = "training",
     srcs = [
         "oblique.cc",
+        "oblique_cpu_depthwise_1pass.cc",
+        "oblique_cpu_symmetric_depthwise_ap.cc",
         "training.cc",
         "vector_sequence.cc",
     ],
     hdrs = [
         "oblique.h",
+        "oblique_cpu_depthwise_1pass.h",
+        "oblique_cpu_symmetric_depthwise_ap.h",
+        "oblique_types.h",
         "training.h",
         "vector_sequence.h",
     ],
     deps = [
+        ":oblique_apply_projection", #ADDED BY JY
         ":decision_tree_cc_proto",
         ":gpu",
         ":label",
@@ -51,6 +85,7 @@ cc_library_ydf(
         "//yggdrasil_decision_forests/utils:distribution",
         "//yggdrasil_decision_forests/utils:distribution_cc_proto",
         "//yggdrasil_decision_forests/utils:logging",
+        "//yggdrasil_decision_forests/utils:parallel_chrono",
         "//yggdrasil_decision_forests/utils:random",
         "//yggdrasil_decision_forests/utils:status_macros",
         "@com_google_absl//absl/base:core_headers",

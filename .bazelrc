@@ -1,3 +1,30 @@
+## SYMMETRIC TREES
+# CatBoost-style symmetric/oblivious trees for Sparse Oblique RF: K candidate
+# projections shared across all nodes at depth d, one bag-wide sweep per
+# candidate. Hooks into GrowTreeLocalBFS's depth-batch loop. Implies BFS.
+# NOTE: does not include CatBoost's shared-entropy logic (1 entropy calc/depth).
+# Runtime knob YDF_SYMMETRIC_MAX_DEPTH (default INT32_MAX = symmetric everywhere)
+# caps the symmetric depth: levels deeper than it hand each frontier node off to
+# the DFS grower (GrowTreeLocal). =0 is all-DFS. See SymmetricMaxDepth() in
+# learner/decision_tree/training.cc; swept by benchmarks' dw1_depth_linesearch.sh
+# --mode=symmetric.
+build:symmetric_depthwise_ap --cxxopt="-DSYMMETRIC_DEPTHWISE_AP=1"
+# Symmetric_Nodewise_Control: isolates shared-projection-sampling from the
+# bagwide column-read effect. K projections sampled once per depth and reused by
+# every node, but each node still runs the normal node-local Evaluate path. Do
+# not combine with --config=symmetric_depthwise_ap (AP path would shadow it).
+build:symmetric_nodewise_control --cxxopt="-DSYMMETRIC_NODEWISE_CONTROL=1"
+# BFS_Only: isolates the cost/benefit of the BFS (level-order) scheduler vs DFS.
+# Triggers GrowTreeLocalBFS but does NOT sample shared projections or call any
+# fused bag-wide Apply -- each node runs the normal per-node sampling + Evaluate,
+# algorithmically identical to the Nodewise baseline, only traversal order
+# differs. Lives by the symmetric_* configs as their BFS-only control but
+# involves no symmetric behavior. Mutually exclusive with symmetric_depthwise_ap
+# and symmetric_nodewise_control.
+build:bfs_only --cxxopt="-DBFS_ONLY=1"
+
+
+
 # Bazel configuration for Yggdrasil Decision Forests
 #
 # OPTIONS

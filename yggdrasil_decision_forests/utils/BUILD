@@ -1002,6 +1002,12 @@ cc_library_ydf(
     ],
 )
 
+cc_library_ydf(
+    name = "parallel_chrono",
+    hdrs = ["parallel_chrono.h"],
+    visibility = ["//visibility:public"],
+)
+
 # Bzl Libraries
 # =============
 

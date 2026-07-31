@@ -107,6 +107,8 @@ absl::StatusOr<ExampleSplitRollingBuffer> SplitExamplesInPlace(
     bool error_on_wrong_splitter_statistics,
     bool examples_are_training_examples = true);
 
+struct AttributeAndWeight;
+
 }  // namespace internal
 
 struct InternalTrainConfig;
@@ -334,6 +336,12 @@ struct InternalTrainConfig {
 
   decision_tree::gpu::VectorSequenceComputer* vector_sequence_computer =
       nullptr;
+
+  const std::vector<std::vector<internal::AttributeAndWeight>>*
+      depthwise_projection_defs = nullptr;
+  const std::vector<int8_t>* depthwise_monotonic = nullptr;
+
+  absl::Span<const float> precomputed_projected_values;
 
   // If true, the list of selected example index ("selected_examples") can
   // contain duplicated values. If false, all selected examples are expected to
@@ -981,6 +989,19 @@ absl::Status GrowTreeBestFirstGlobal(
     std::optional<SelectedExamplesRollingBuffer> leaf_examples);
 
 absl::Status GrowTreeLocal(
+    const dataset::VerticalDataset& train_dataset,
+    const model::proto::TrainingConfig& config,
+    const model::proto::TrainingConfigLinking& config_link,
+    const proto::DecisionTreeTrainingConfig& dt_config,
+    const model::proto::DeploymentConfig& deployment,
+    const std::vector<float>& weights, int32_t depth,
+    const InternalTrainConfig& internal_config,
+    const NodeConstraints& constraints, bool set_leaf_already_set,
+    NodeWithChildren* root, utils::RandomEngine* random, PerThreadCache* cache,
+    SelectedExamplesRollingBuffer selected_examples,
+    std::optional<SelectedExamplesRollingBuffer> leaf_examples);
+
+absl::Status GrowTreeLocalBFS(
     const dataset::VerticalDataset& train_dataset,
     const model::proto::TrainingConfig& config,
     const model::proto::TrainingConfigLinking& config_link,

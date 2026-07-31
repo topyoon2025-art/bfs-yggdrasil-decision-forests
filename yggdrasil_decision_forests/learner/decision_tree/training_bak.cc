@@ -4974,6 +4974,10 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE static absl::Status NodeTrain(
   auto& selected_examples = node_and_examples.selected_examples;
   auto& leaf_examples = node_and_examples.leaf_examples;
   const auto depth = node_and_examples.depth;
+  std::cout << "NodeTrain: depth=" << depth
+            << " examples=" << selected_examples.size()
+            << " has_precomputed=" << !internal_config.precomputed_projected_values.empty()
+            << std::endl;
   const auto& constraints = node_and_examples.constraints;
   const auto set_leaf_already_set = node_and_examples.set_leaf_already_set;
   auto node = node_and_examples.node;
@@ -5169,6 +5173,11 @@ absl::Status GrowTreeLocal(
     auto current_node = std::move(node_stack.back());
     node_stack.pop_back();
 
+    // ADDED BY JY
+    std::cout << "Processing node at depth: " << current_node.depth 
+              << " with " << current_node.selected_examples.size() 
+              << " selected examples." << std::endl;
+    
     RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
                               deployment, weights, internal_config, random,
                               cache, std::move(current_node), node_stack));
@@ -5221,24 +5230,20 @@ absl::Status GrowTreeLocalBFS(
   std::cout << "Time taken for dataset flattening: " << elapsed_time_flatten.count() << " ms." << std::endl;
 
 
+  // 2.1) Preprocessing: Allocate device memory for flattened data and labels
+  std::chrono::steady_clock::time_point start_time_cuda_alloc = std::chrono::steady_clock::now();
   float* d_flat_data = nullptr;
   cudaMalloc(&d_flat_data, static_cast<size_t>(num_rows) * num_cols * sizeof(float));
   cudaMemcpy(d_flat_data, flat.data(), static_cast<size_t>(num_rows) * num_cols * sizeof(float), cudaMemcpyHostToDevice);
-  std::vector<float>().swap(flat);  // free host copy
-
+  
+  // 2.2) Preprocessing: Copy labels to device
   int* d_labels = nullptr;
   cudaMalloc(&d_labels, num_rows * sizeof(int));
   cudaMemcpy(d_labels, labels.data(), num_rows * sizeof(int), cudaMemcpyHostToDevice);
+  std::chrono::steady_clock::time_point end_time_cuda_alloc = std::chrono::steady_clock::now();
+  std::chrono::duration<double, std::milli> elapsed_time_cuda_alloc = end_time_cuda_alloc - start_time_cuda_alloc;
+  std::cout << "Time taken for CUDA memory allocation: " << elapsed_time_cuda_alloc.count() << " ms." << std::endl;
 
-
-  // Pre-allocate reusable GPU buffers sized for worst case (root level).
-  const int max_num_proj = GetNumProjections(
-      dt_config, config_link.numerical_features_size());
-  int* d_selected_examples = nullptr;
-  float* d_col_add_projected = nullptr;
-  cudaMalloc(&d_selected_examples, static_cast<size_t>(num_rows) * sizeof(int));
-  cudaMalloc(&d_col_add_projected,
-             static_cast<size_t>(num_rows) * max_num_proj * sizeof(float));
 
   std::deque<internal::NodeAndExamples> node_queue;
   node_queue.push_back({root, std::move(selected_examples),
@@ -5257,23 +5262,30 @@ absl::Status GrowTreeLocalBFS(
     }
 
     #if defined(DEPTHWISE_1_PASS)
-      if (dt_config.has_sparse_oblique_split() && depth_batch.size() >= 1) {
-        auto t_proj_start = std::chrono::steady_clock::now();
+      if (dt_config.has_sparse_oblique_split() && depth_batch.size() > 1) {
+        // Fused-per-level CPU Apply. Sample projections per node, preserving
+        // ordinary Sparse Oblique RF semantics, then precompute each node's
+        // projected-value slab before per-node split search.
         const int num_proj = GetNumProjections(
-            dt_config, config_link.numerical_features_size());
+            dt_config, config_link.numerical_features_size()) * 1.5;
         const float projection_density = std::clamp(
             dt_config.sparse_oblique_split().projection_density_factor() /
                 config_link.numerical_features_size(),
             0.f, 1.f);
 
         const int num_nodes = depth_batch.size();
-        // Sample projections for each node
+        // Both dimensions are known on entry to the depth level: num_nodes is the
+        // frontier size and num_proj is static. Size the full 2D structure once
+        // here (outside the CHRONO_SCOPE below) so the allocation is not billed to
+        // kSampleProjection and the per-node resize/assign vanishes from the hot
+        // loop. SampleProjection self-clears each Projection (sparse list) and
+        // unconditionally writes monotonic_direction, so no pre-zeroing is needed.
         std::vector<std::vector<internal::Projection>> all_node_projs(
             num_nodes, std::vector<internal::Projection>(num_proj));
         std::vector<std::vector<int8_t>> all_node_mono(
             num_nodes, std::vector<int8_t>(num_proj));
 
-        // Node-major sampling
+        // Projection-major sampling (K projections x 2^d nodes)
         for (int n = 0; n < num_nodes; ++n) {
           for (int p = 0; p < num_proj; ++p) {
             internal::SampleProjection(
@@ -5283,104 +5295,41 @@ absl::Status GrowTreeLocalBFS(
           }
         }
 
+        std::cout << "Depth " << current_depth << ": "
+                  << num_nodes << " nodes, "
+                  << num_proj << " projections per node, "
+                  << projection_density << " density factor." << std::endl;
+        std::cout << "All node projs:" << std::endl;
+        for (int n = 0; n < num_nodes; ++n) {
+          std::cout << "Node " << n << ": ";
+          for (int p = 0; p < num_proj; ++p) {
+            std::cout << "Proj " << p << ": ";
+                
+            std::cout << "Mono: " << static_cast<int>(all_node_mono[n][p]) << "; ";
+          }
+          std::cout << std::endl;
+        } 
+
+
         std::vector<absl::Span<const UnsignedExampleIdx>> sel_spans(num_nodes);
-        size_t total_rows = 0; 
         for (int n = 0; n < num_nodes; ++n) {
-            sel_spans[n] = depth_batch[n].selected_examples.active;
-            total_rows += sel_spans[n].size(); //per depth_batch, total number of selected examples across all nodes
+          sel_spans[n] = depth_batch[n].selected_examples.active;
         }
 
-        std::vector<UnsignedExampleIdx> flat_sel(total_rows);
-        std::vector<int> node_row_offsets(num_nodes + 1);
-        node_row_offsets[0] = 0;
-        for (int n = 0; n < num_nodes; ++n) {
-            std::copy(sel_spans[n].begin(), sel_spans[n].end(),
-                    flat_sel.begin() + node_row_offsets[n]);
-            node_row_offsets[n + 1] = node_row_offsets[n] + sel_spans[n].size();
-        }
+        std::vector<std::vector<float>> projected(num_nodes);
 
-        const int num_segments = num_proj * num_nodes;
-        std::vector<int> flat_proj_col_idx;
-        std::vector<float> flat_proj_weights;
-        std::vector<int> proj_offsets(num_segments + 1);
-        proj_offsets[0] = 0;
-        for (int n = 0; n < num_nodes; ++n) {
-            for (int p = 0; p < num_proj; ++p) {
-                for (const auto& aw : all_node_projs[n][p]) {
-                    flat_proj_col_idx.push_back(aw.attribute_idx);
-                    flat_proj_weights.push_back(aw.weight);
-                }
-                proj_offsets[n * num_proj + p + 1] =
-                    static_cast<int>(flat_proj_col_idx.size());
-            }
-        }
-
-        // Small metadata buffers — vary by depth, cheap to alloc/free.
-        int* d_offset = nullptr;
-        int* d_flat_projection_col_idx = nullptr;
-        float* d_flat_projection_weights = nullptr;
-        int* d_node_row_off = nullptr;
-        cudaMalloc(&d_offset, (num_segments + 1) * sizeof(int));
-        cudaMalloc(&d_flat_projection_col_idx, flat_proj_col_idx.size() * sizeof(int));
-        cudaMalloc(&d_flat_projection_weights, flat_proj_weights.size() * sizeof(float));
-        cudaMalloc(&d_node_row_off, (num_nodes + 1) * sizeof(int));
-
-        // d_selected_examples and d_col_add_projected are pre-allocated.
-        cudaMemcpy(d_selected_examples, flat_sel.data(), total_rows * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_offset, proj_offsets.data(), (num_segments + 1) * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_flat_projection_col_idx, flat_proj_col_idx.data(), flat_proj_col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_flat_projection_weights, flat_proj_weights.data(), flat_proj_weights.size() * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_node_row_off, node_row_offsets.data(), (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
-
-        int selected_features_count = 1;
-        ColumnAddProjectionKernel_SRDW_1_NP_func(d_flat_data,
-                                                 d_selected_examples,
-                                                 d_col_add_projected,
-                                                 d_offset,
-                                                 d_flat_projection_col_idx,
-                                                 d_flat_projection_weights,
-                                                 d_node_row_off,
-                                                 num_nodes,
-                                                 num_proj,
-                                                 num_rows,
-                                                 selected_features_count);
-        cudaDeviceSynchronize();
-
-        // Single bulk copy back instead of per-node copies.
-        std::vector<float> projected_all(total_rows * num_proj);
-        cudaMemcpy(projected_all.data(), d_col_add_projected,
-                   total_rows * num_proj * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-
-        cudaFree(d_offset);
-        cudaFree(d_flat_projection_col_idx);
-        cudaFree(d_flat_projection_weights);
-        cudaFree(d_node_row_off);
-
-        auto t_proj_end = std::chrono::steady_clock::now();
-        auto t_split_start = std::chrono::steady_clock::now();
-
-        size_t gpu_offset = 0;
-        for (int n = 0; n < num_nodes; ++n) {
-          const size_t slab = num_proj * sel_spans[n].size();
-          auto node_config = internal_config;
-          node_config.depthwise_projection_defs = &all_node_projs[n];
-          node_config.depthwise_monotonic = &all_node_mono[n];
-          node_config.precomputed_projected_values =
-              absl::MakeConstSpan(projected_all.data() + gpu_offset, slab);
-          RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
-                                    deployment, weights, node_config, random,
-                                    cache, std::move(depth_batch[n]),
-                                    node_queue));
-          gpu_offset += slab;
-        }
-        auto t_split_end = std::chrono::steady_clock::now();
-        std::cerr << "D" << current_depth
-                  << " nodes=" << num_nodes
-                  << " rows=" << total_rows
-                  << " proj=" << std::chrono::duration<double,std::milli>(t_proj_end - t_proj_start).count() << "ms"
-                  << " split=" << std::chrono::duration<double,std::milli>(t_split_end - t_split_start).count() << "ms"
-                  << "\n";
+      for (int n = 0; n < num_nodes; ++n) {
+        auto node_config = internal_config;
+        node_config.depthwise_projection_defs = &all_node_projs[n];
+        node_config.depthwise_monotonic = &all_node_mono[n];
+        node_config.precomputed_projected_values =
+            absl::MakeConstSpan(projected[n]);
+        RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
+                                  deployment, weights, node_config, random,
+                                  cache, std::move(depth_batch[n]),
+                                  node_queue));
+        std::vector<float>().swap(projected[n]);
+      }
     } else
 #elif defined(SYMMETRIC_DEPTHWISE_AP)
     if (dt_config.has_sparse_oblique_split() && depth_batch.size() >= 1) {
@@ -5602,10 +5551,6 @@ absl::Status GrowTreeLocalBFS(
       }
     }
   }
-  cudaFree(d_selected_examples);
-  cudaFree(d_col_add_projected);
-  cudaFree(d_flat_data);
-  cudaFree(d_labels);
   return absl::OkStatus();
 }
 

@@ -16,9 +16,11 @@
 #include "yggdrasil_decision_forests/learner/decision_tree/oblique.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -48,6 +50,10 @@
 #include "yggdrasil_decision_forests/utils/logging.h"
 #include "yggdrasil_decision_forests/utils/random.h"
 #include "yggdrasil_decision_forests/utils/status_macros.h"
+
+#ifndef BFS_ONLY
+#define BFS_ONLY 0
+#endif
 
 namespace yggdrasil_decision_forests {
 namespace model {
@@ -110,6 +116,7 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
     return 1;
   }
 
+
   switch (dt_config.split_axis_case()) {
     case proto::DecisionTreeTrainingConfig::kSparseObliqueSplit: {
       const int max_num_projections =
@@ -117,7 +124,7 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
 
       const int min_num_projections =
           std::min(dt_config.sparse_oblique_split().min_num_projections(),
-                   num_numerical_features);
+                  num_numerical_features);
 
       const int target_num_projections =
           0.5 +
@@ -125,7 +132,11 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
               num_numerical_features,
               dt_config.sparse_oblique_split().num_projections_exponent()));
 
-      return std::max(std::min(target_num_projections, max_num_projections),
+      // MODIFIED BY JY
+      // return std::max(std::min(target_num_projections, max_num_projections),
+      //                 min_num_projections);
+      return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
+                      max_num_projections),
                       min_num_projections);
     } break;
     case proto::DecisionTreeTrainingConfig::kGuidedObliqueSplit: {
@@ -133,13 +144,17 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
           dt_config.guided_oblique_split().max_num_candidate();
       const int min_num_projections =
           std::min(dt_config.guided_oblique_split().min_num_candidate(),
-                   num_numerical_features);
+                  num_numerical_features);
 
       const int target_num_projections =
           0.5 + std::ceil(std::pow(
                     num_numerical_features,
                     dt_config.guided_oblique_split().num_candidate_exponent()));
-      return std::max(std::min(target_num_projections, max_num_projections),
+      // MODIFIED BY JY
+      // return std::max(std::min(target_num_projections, max_num_projections),
+      //                 min_num_projections);
+      return std::max(std::min(static_cast<int>(target_num_projections * 1.5),
+                      max_num_projections),
                       min_num_projections);
     } break;
     case proto::DecisionTreeTrainingConfig::SPLIT_AXIS_NOT_SET:
@@ -147,6 +162,7 @@ int GetNumProjections(const proto::DecisionTreeTrainingConfig& dt_config,
     case proto::DecisionTreeTrainingConfig::kAxisAlignedSplit:
       return 1;
   }
+  
 }
 
 template <typename LabelStats>
@@ -170,66 +186,108 @@ absl::StatusOr<bool> FindBestConditionSparseObliqueTemplate(
     return false;
   }
 
-  // Effective number of projections to test.
-  int num_projections;
-  if (override_num_projections.has_value()) {
-    num_projections = override_num_projections.value();
-  } else {
-    num_projections =
-        GetNumProjections(dt_config, config_link.numerical_features_size());
-  }
-
-  const float projection_density =
-      std::clamp(dt_config.sparse_oblique_split().projection_density_factor() /
-                     config_link.numerical_features_size(),
-                 0.f, 1.f);
-
-  // Best and current projections.
-  Projection best_projection;
-  float best_threshold;
-  Projection current_projection;
-  auto& projection_values = cache->projection_values;
-
-  ProjectionEvaluator projection_evaluator(train_dataset,
-                                           config_link.numerical_features());
-
+  Projection best_projection; // Both
+  float best_threshold; // Both
   // TODO: Cache.
-  const auto selected_labels = ExtractLabels(label_stats, selected_examples);
-  std::vector<float> selected_weights;
+  const auto selected_labels = ExtractLabels(label_stats, selected_examples); // Both
+  std::vector<float> selected_weights; // Both
   if (!weights.empty()) {
     selected_weights = Extract(weights, selected_examples);
   }
 
-  std::vector<UnsignedExampleIdx> dense_example_idxs(selected_examples.size());
-  std::iota(dense_example_idxs.begin(), dense_example_idxs.end(), 0);
+  std::vector<UnsignedExampleIdx> dense_example_idxs(selected_examples.size()); // Both
+  std::iota(dense_example_idxs.begin(), dense_example_idxs.end(), 0); // Both
 
-  for (int projection_idx = 0; projection_idx < num_projections;
-       projection_idx++) {
-    // Generate a current_projection.
-    int8_t monotonic_direction;
-    SampleProjection(config_link.numerical_features(), dt_config,
-                     train_dataset.data_spec(), config_link, projection_density,
-                     &current_projection, &monotonic_direction, random);
-
-    // Pre-compute the result of the current_projection.
-    RETURN_IF_ERROR(projection_evaluator.Evaluate(
-        current_projection, selected_examples, &projection_values));
-
-    ASSIGN_OR_RETURN(
-        const auto result,
-        EvaluateProjection(
-            dt_config, label_stats, dense_example_idxs, selected_weights,
-            selected_labels, projection_values, internal_config,
-            current_projection.front().attribute_idx, constraints,
-            monotonic_direction, best_condition, cache));
-
-    if (result == SplitSearchResult::kBetterSplitFound) {
-      best_projection = current_projection;
-      best_threshold =
-          best_condition->condition().higher_condition().threshold();
+  const bool has_precomputed_projected =
+    !internal_config.precomputed_projected_values.empty() &&
+    internal_config.depthwise_projection_defs != nullptr &&
+    internal_config.depthwise_monotonic != nullptr;
+  
+  if (has_precomputed_projected) {
+    // Use precomputed projected values.
+    const auto& depth_projs = *internal_config.depthwise_projection_defs;
+    const auto& depth_mono = *internal_config.depthwise_monotonic;
+    const size_t rows_n = selected_examples.size();
+    const size_t num_projs = depth_projs.size();
+    const float* slab = internal_config.precomputed_projected_values.data();
+    for (size_t proj_idx = 0; proj_idx < num_projs; ++proj_idx) {
+      if (depth_projs[proj_idx].empty()) continue;
+      const absl::Span<const float> values_span =
+          absl::MakeConstSpan(slab + proj_idx * rows_n, rows_n);
+      ASSIGN_OR_RETURN(
+          const auto result,
+          EvaluateProjection(dt_config, label_stats, dense_example_idxs,
+                             selected_weights, selected_labels, values_span,
+                             internal_config,
+                             depth_projs[proj_idx].front().attribute_idx,
+                             constraints, depth_mono[proj_idx], best_condition,
+                             cache));
+      if (result == SplitSearchResult::kBetterSplitFound) {
+        best_projection = depth_projs[proj_idx];
+        best_threshold =
+            best_condition->condition().higher_condition().threshold();
+      }
     }
-  }
+  } else {
+    // Effective number of projections to test.
+    int num_projections; // DFS Only
+    if (override_num_projections.has_value()) {
+      num_projections = override_num_projections.value();
+    } else {
+      num_projections =
+          GetNumProjections(dt_config, config_link.numerical_features_size());
+    }
 
+    const float projection_density = // DFS Only
+        std::clamp(dt_config.sparse_oblique_split().projection_density_factor() /
+                      config_link.numerical_features_size(),
+                  0.f, 1.f);
+
+
+    Projection current_projection; // DFS only
+    auto& projection_values = cache->projection_values; // DFS only
+
+    ProjectionEvaluator projection_evaluator(train_dataset,
+                                              config_link.numerical_features()); // DFS only
+
+    double proj_ms = 0, split_ms = 0;
+    for (int projection_idx = 0; projection_idx < num_projections;
+        projection_idx++) {
+      // Generate a current_projection.
+      int8_t monotonic_direction;
+      SampleProjection(config_link.numerical_features(), dt_config,
+                      train_dataset.data_spec(), config_link, projection_density,
+                      &current_projection, &monotonic_direction, random);
+
+      // Pre-compute the result of the current_projection.
+      auto t0 = std::chrono::steady_clock::now();
+      RETURN_IF_ERROR(projection_evaluator.Evaluate(
+          current_projection, selected_examples, &projection_values));
+      auto t1 = std::chrono::steady_clock::now();
+
+      ASSIGN_OR_RETURN(
+          const auto result,
+          EvaluateProjection(
+              dt_config, label_stats, dense_example_idxs, selected_weights,
+              selected_labels, projection_values, internal_config,
+              current_projection.front().attribute_idx, constraints,
+              monotonic_direction, best_condition, cache));
+      auto t2 = std::chrono::steady_clock::now();
+
+      proj_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+      split_ms += std::chrono::duration<double, std::milli>(t2 - t1).count();
+
+      if (result == SplitSearchResult::kBetterSplitFound) {
+        best_projection = current_projection;
+        best_threshold =
+            best_condition->condition().higher_condition().threshold();
+      }
+    }
+    std::cerr << "DFS node examples=" << selected_examples.size()
+              << " nproj=" << num_projections
+              << " proj=" << proj_ms << "ms"
+              << " split=" << split_ms << "ms\n";
+  }
   // Update with the actual current_projection definition.
   if (!best_projection.empty()) {
     RETURN_IF_ERROR(SetCondition(best_projection, best_threshold,
@@ -369,6 +427,7 @@ absl::StatusOr<bool> FindBestConditionGuidedObliqueTemplate(
 
   return false;
 }
+
 
 absl::Status SolveLDA(const proto::DecisionTreeTrainingConfig& dt_config,
                       const ProjectionEvaluator& projection_evaluator,
@@ -1149,8 +1208,15 @@ void SampleProjection(const absl::Span<const int>& features,
   std::binomial_distribution<size_t> binom(features.size(), projection_density);
 
   // Expectation[Binomial(p,projection_density)] = num_selected_features
-  const size_t num_selected_features = binom(*random);
+  // const size_t num_selected_features = binom(*random);
+  size_t num_selected_features = binom(*random);
+  
 
+  // To control the number of selected features, we can use the max_num_features parameter.
+  // MODIFIED BY JY
+  num_selected_features = 1;
+ 
+  
   // TODO: Try std::bitmap
   absl::btree_set<size_t> picked_idx;
 
@@ -1389,6 +1455,7 @@ ProjectionEvaluator::ProjectionEvaluator(
       *std::max_element(numerical_features.begin(), numerical_features.end());
 
   numerical_attributes_.assign(max_feature_idx + 1, nullptr);
+  numerical_attribute_data_.assign(max_feature_idx + 1, nullptr);
   na_replacement_value_.assign(max_feature_idx + 1, 0.f);
 
   for (const auto attribute_idx : numerical_features) {
@@ -1400,6 +1467,8 @@ ProjectionEvaluator::ProjectionEvaluator(
     }
 
     numerical_attributes_[attribute_idx] = &column_or.value()->values();
+    numerical_attribute_data_[attribute_idx] =
+        column_or.value()->values().data();
     na_replacement_value_[attribute_idx] =
         train_dataset.data_spec().columns(attribute_idx).numerical().mean();
   }

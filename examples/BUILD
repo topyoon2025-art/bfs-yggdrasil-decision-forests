@@ -66,3 +66,37 @@ cc_binary(
         "@com_google_absl//absl/strings",
     ],
 )
+
+#ADDED BY JY
+cc_binary(
+    name = "oblique_apply_projection_main",
+    #MODIFIED BY JY
+    srcs = ["oblique_apply_projection_main.cc", "parallel_utils.hpp", "maximize_groupings.hpp"],
+    
+    # linkopts = ["-pg"],
+    # features = ["c++17"],
+    deps = [
+        "//yggdrasil_decision_forests/dataset:all_dataset_formats",
+        "//yggdrasil_decision_forests/dataset:data_spec",
+        "//yggdrasil_decision_forests/dataset:data_spec_cc_proto",
+        "//yggdrasil_decision_forests/dataset:data_spec_inference",
+        "//yggdrasil_decision_forests/dataset:vertical_dataset",
+        "//yggdrasil_decision_forests/dataset:vertical_dataset_io",
+        "//yggdrasil_decision_forests/dataset:csv_example_reader",
+        "//yggdrasil_decision_forests/learner/random_forest:random_forest",
+        "//yggdrasil_decision_forests/learner/gradient_boosted_trees",
+        "//yggdrasil_decision_forests/learner:learner_library",
+        "//yggdrasil_decision_forests/learner/decision_tree:training",
+        "//yggdrasil_decision_forests/model/random_forest:random_forest",
+        "//yggdrasil_decision_forests/model:model_library",
+        "//yggdrasil_decision_forests/utils:filesystem",
+        "//yggdrasil_decision_forests/utils:logging",
+        "//yggdrasil_decision_forests/utils:distribution",
+        "//yggdrasil_decision_forests/utils:random",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+    ],    
+)

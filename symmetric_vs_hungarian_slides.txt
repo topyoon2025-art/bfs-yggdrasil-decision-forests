@@ -1,0 +1,137 @@
+================================================================================
+SLIDE 1 — Title
+================================================================================
+
+Why Symmetric Scales and Hungarian Doesn't
+GPU Column-Grouping Strategies for Oblique Apply-Projection
+
+Question: Between 2M×16 and 8M×16 datasets, symmetric's GPU kernel
+performance is stable — but hungarian degrades. Why?
+
+
+================================================================================
+SLIDE 2 — What Each Strategy Does
+================================================================================
+
+SYMMETRIC (strategy 6)
+  • Replaces every node's column indices with a single shared set
+  • Picks the K most popular columns across all nodes, replicates to every row
+  • Result: 100% column uniformity — all nodes read the same column at each slot
+  • Cost: O(N·K) frequency count — independent of dataset row count
+
+HUNGARIAN (strategy 4 — iterative_hungarian_grouping)
+  • Reorders each node's column indices to maximize cross-node alignment
+  • Per iteration: remove one node → build K×K cost matrix → solve O(K³)
+    Hungarian assignment → reinsert
+  • Result: partial column uniformity — alignment is best-effort
+  • Cost: O(iters × N × K³) — also independent of dataset row count
+
+Neither strategy's reordering cost depends on #rows.
+The difference is what happens in the GPU kernel AFTER reordering.
+
+
+================================================================================
+SLIDE 3 — The GPU Kernel: It's Always a Gather
+================================================================================
+
+Every thread in the apply-projection kernel does:
+
+    ex_idx = selected_examples[row_start + r]        // monotonic, not contiguous
+    dataset_idx = col * num_rows + ex_idx             // column-major layout
+    x = dataset[dataset_idx]                          // GATHER — sparse read
+
+Key point: even in symmetric, the read within a column is a sparse gather.
+  • selected_examples per node are sorted (monotonic) but have gaps
+  • Consecutive threads in a warp hit nearby but NOT adjacent addresses
+  • Each 128-byte cache line (32 floats) may have only a few useful values
+
+So the advantage of symmetric is NOT "contiguous reads."
+It's about how many DISTINCT columns the L2 cache must hold simultaneously.
+
+
+================================================================================
+SLIDE 4 — Symmetric: One Column Active at a Time
+================================================================================
+
+                       SYMMETRIC
+    ┌──────────────────────────────────────┐
+    │  Projection slot j                   │
+    │                                      │
+    │  Node 0 ──gather──► column 5         │
+    │  Node 1 ──gather──► column 5         │
+    │  Node 2 ──gather──► column 5         │
+    │  ...                                 │
+    │  Node 63 ─gather──► column 5         │
+    │                                      │
+    │  L2 working set = 1 column           │
+    └──────────────────────────────────────┘
+
+  • All blocks read the SAME column → cache lines are shared across blocks
+  • Union of all nodes' examples ≈ full bag (~63% of rows)
+  • Block A pulls cache line for row 37; Block B needs row 39 → L2 HIT
+  • Total L2 footprint per slot = num_rows × 4 bytes (one column)
+
+
+                       HUNGARIAN
+    ┌──────────────────────────────────────┐
+    │  Projection slot j                   │
+    │                                      │
+    │  Node 0 ──gather──► column 5  ┐     │
+    │  Node 1 ──gather──► column 5  ├ aligned    │
+    │  Node 2 ──gather──► column 12 ┐     │
+    │  Node 3 ──gather──► column 3  ├ misaligned │
+    │  ...                                 │
+    │                                      │
+    │  L2 working set = C columns          │
+    └──────────────────────────────────────┘
+
+  • Partial alignment → C distinct columns active simultaneously
+  • No cross-node L2 reuse between columns 5, 12, and 3
+  • Total L2 footprint per slot = C × num_rows × 4 bytes
+
+
+================================================================================
+SLIDE 5 — The Scaling Table: Why 8M Breaks Hungarian
+================================================================================
+
+GPU L2 cache size: ~40 MB (A100) / ~50 MB (H100)
+
+    ┌──────────┬────────────┬──────────────────┬──────────────────────┐
+    │ Dataset  │ 1 column   │ Symmetric        │ Hungarian            │
+    │          │ size       │ (1 col active)   │ (C~3 cols active)    │
+    ├──────────┼────────────┼──────────────────┼──────────────────────┤
+    │ 2M × 16  │   8 MB     │   8 MB  ✓ fit   │  24 MB   ✓ fit      │
+    │ 8M × 16  │  32 MB     │  32 MB  ✓ fit   │  96 MB   ✗ overflow │
+    └──────────┴────────────┴──────────────────┴──────────────────────┘
+
+  • Symmetric: 1 × 32 MB = 32 MB at 8M rows → still fits L2
+  • Hungarian: C × 32 MB overflows L2 even at C = 2
+
+  Once L2 overflows:
+    → Every cache miss on a gather goes to HBM (~10× slower)
+    → Sparse access amplifies the penalty: each evicted 128-byte cache line
+      carried mostly unused bytes
+    → Thrashing: column A evicts column B's lines, column B evicts A's
+
+
+================================================================================
+SLIDE 6 — Conclusion
+================================================================================
+
+  • Both strategies produce a sparse gather in the GPU kernel — neither
+    gives truly contiguous reads
+
+  • The critical difference is L2 WORKING SET SIZE:
+      Symmetric  →  1 column per projection slot  →  scales with row count
+      Hungarian  →  C columns per slot             →  scales with C × row count
+
+  • At small datasets (2M), even C > 1 columns fit in L2 → both perform well
+
+  • At large datasets (8M), C > 1 columns overflow L2 → hungarian pays HBM
+    latency on every gather miss, while symmetric still fits
+
+  • Symmetric is dataset-size-insensitive because its perfect column
+    uniformity confines the working set to a single column's address range,
+    regardless of how large that column gets (up to L2 capacity)
+
+================================================================================

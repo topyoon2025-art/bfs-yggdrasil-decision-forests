@@ -54,6 +54,7 @@
 #include "yggdrasil_decision_forests/learner/abstract_learner.pb.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/decision_tree.pb.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/label.h"
+#include "yggdrasil_decision_forests/learner/decision_tree/oblique_types.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/training.h"
 #include "yggdrasil_decision_forests/learner/decision_tree/utils.h"
 #include "yggdrasil_decision_forests/model/decision_tree/decision_tree.pb.h"
@@ -152,13 +153,9 @@ absl::StatusOr<SplitSearchResult> EvaluateProjection(
 
 namespace internal {
 
-// A projection is defined as \sum features[projection[i].index] *
-// projection[i].weight;
-struct AttributeAndWeight {
-  int attribute_idx;
-  float weight;
-};
-typedef std::vector<AttributeAndWeight> Projection;
+// `AttributeAndWeight` and `Projection` (the per-node sparse projection type)
+// are defined in `oblique_types.h` so they can be shared with the CUDA
+// TUs without pulling in the heavy absl/protobuf transitive includes.
 
 // Utility to evaluate projections.
 //
@@ -193,6 +190,15 @@ class ProjectionEvaluator {
     return *numerical_attributes_[attribute_idx];
   }
 
+
+  const float* AttributeData(int attribute_idx) const {
+    return numerical_attribute_data_[attribute_idx];
+  }
+
+  float AttributeValue(int attribute_idx, UnsignedExampleIdx example_idx) const {
+    return numerical_attribute_data_[attribute_idx][example_idx];
+  }
+
   float NaReplacementValue(int attribute_idx) const {
     return na_replacement_value_[attribute_idx];
   }
@@ -205,6 +211,7 @@ class ProjectionEvaluator {
   // Non-owning pointer to numerical attributes.
   // Indexed by attribute idx.
   std::vector<const std::vector<float>*> numerical_attributes_;
+  std::vector<const float*> numerical_attribute_data_;
 
   // Replacement for missing values.
   // Indexed by attribute idx.
