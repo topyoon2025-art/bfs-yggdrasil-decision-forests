@@ -12,7 +12,7 @@
 #include <sstream>
 #include <vector>
 
-#include "maximize_groupings.hpp"
+#include "yggdrasil_decision_forests/learner/decision_tree/maximize_groupings.h"
 
 namespace Utils {
 
@@ -345,6 +345,60 @@ namespace Utils {
                     int i = slot % selected_features_count;
                     proj.col_idx[n][p][i] = target;
                     proj.weights[n][p][i] = 1.0f;
+                }
+            }
+        }
+    }
+
+    // Overload for AoS projection layout (e.g. YDF's
+    // std::vector<std::vector<Projection>> where each Projection element
+    // has .attribute_idx and .weight).
+    template <typename Proj>
+    inline void reorderProjections(std::vector<std::vector<Proj>>& all_node_projs,
+                                    int num_proj, int num_nodes,
+                                    int selected_features_count,
+                                    int reorder_strategy, bool verbose) {
+        if (reorder_strategy <= 0) return;
+
+        int K = num_proj * selected_features_count;
+        std::vector<std::vector<int>> rows(num_nodes, std::vector<int>(K));
+        for (int n = 0; n < num_nodes; ++n)
+            for (int p = 0; p < num_proj; ++p)
+                for (int i = 0; i < selected_features_count; ++i)
+                    rows[n][p * selected_features_count + i] =
+                        all_node_projs[n][p][i].attribute_idx;
+
+        auto optimized = mcg::maximize_column_groupings(rows, reorder_strategy, verbose);
+
+        for (int n = 0; n < num_nodes; ++n) {
+            struct CW { int col; float w; };
+            std::vector<CW> orig;
+            orig.reserve(K);
+            for (int p = 0; p < num_proj; ++p)
+                for (int i = 0; i < selected_features_count; ++i)
+                    orig.push_back({all_node_projs[n][p][i].attribute_idx,
+                                    all_node_projs[n][p][i].weight});
+
+            std::vector<bool> used(orig.size(), false);
+            for (int slot = 0; slot < K; ++slot) {
+                int target = optimized[n][slot];
+                bool found = false;
+                for (size_t j = 0; j < orig.size(); ++j) {
+                    if (!used[j] && orig[j].col == target) {
+                        int p = slot / selected_features_count;
+                        int i = slot % selected_features_count;
+                        all_node_projs[n][p][i].attribute_idx = orig[j].col;
+                        all_node_projs[n][p][i].weight = orig[j].w;
+                        used[j] = true;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    int p = slot / selected_features_count;
+                    int i = slot % selected_features_count;
+                    all_node_projs[n][p][i].attribute_idx = target;
+                    all_node_projs[n][p][i].weight = 1.0f;
                 }
             }
         }

@@ -1,6 +1,6 @@
 #include "oblique_apply_projection.cuh"
 #include "parallel_utils.hpp"
-#include "maximize_groupings.hpp"
+#include "yggdrasil_decision_forests/learner/decision_tree/maximize_groupings.h"
 #include <cfloat>
 
 #include "yggdrasil_decision_forests/learner/decision_tree/oblique.h"
@@ -38,7 +38,7 @@ ABSL_FLAG(std::string, feature_split_type, "Oblique",
           "Type of feature splits in decision trees: 'Axis Aligned' or 'Oblique'.");
 
 // Oblique split parameters (only used when feature_split_type = "Oblique")
-ABSL_FLAG(int, max_num_projections, 1000,
+ABSL_FLAG(int, max_num_projections, 64,
           "Maximum number of projections for oblique splits.");
 ABSL_FLAG(float, num_projections_exponent, .5,
           "Exponent to determine number of projections.");
@@ -62,8 +62,8 @@ ABSL_FLAG(uint32_t, seed, 1,
           "PRNG seed (for deterministic synthetic mode and model training).");
 
 // Histogram-based splits - Updated to match Yggdrasil implementation
-ABSL_FLAG(std::string, numerical_split_type, "Exact",
-          "Type of histogram splitting: 'Exact (no histogramming)', 'Random', 'Equal Width', 'Dynamic Random Histogram' or 'Dynamic Equal Width Histogram.");
+ABSL_FLAG(std::string, numerical_split_type, "Equal Width",
+          "Type of numerical splitting: 'Exact', 'Random', or 'Equal Width'.");
 ABSL_FLAG(int, histogram_num_bins, 256,
           "Number of bins for histogram splitting.");
 
@@ -399,9 +399,21 @@ int main (int argc, char* argv[]) {
         numerical_split->set_type(
             yggdrasil_decision_forests::model::decision_tree::proto::NumericalSplit::EXACT);
         LOG(INFO) << "Using exact splitting";
+    } else if (hist_type == "Random") {
+        numerical_split->set_type(
+            yggdrasil_decision_forests::model::decision_tree::proto::NumericalSplit::HISTOGRAM_RANDOM);
+        numerical_split->set_num_candidates(absl::GetFlag(FLAGS_histogram_num_bins));
+        LOG(INFO) << "Using random histogram splitting with "
+                  << absl::GetFlag(FLAGS_histogram_num_bins) << " bins";
+    } else if (hist_type == "Equal Width") {
+        numerical_split->set_type(
+            yggdrasil_decision_forests::model::decision_tree::proto::NumericalSplit::HISTOGRAM_EQUAL_WIDTH);
+        numerical_split->set_num_candidates(absl::GetFlag(FLAGS_histogram_num_bins));
+        LOG(INFO) << "Using equal width histogram splitting with "
+                  << absl::GetFlag(FLAGS_histogram_num_bins) << " bins";
     } else {
-        std::cerr << "Unknown histogram type: " << hist_type 
-                << ". Use 'Exact', 'Random', 'Equal Width', 'Dynamic Equal Width Histogram' or 'Dynamic Random Histogram'.\n";
+        std::cerr << "Unknown histogram type: " << hist_type
+                << ". Use 'Exact', 'Random', or 'Equal Width'.\n";
         return 1;
     }
 
@@ -444,7 +456,7 @@ int main (int argc, char* argv[]) {
 
     // std::vector<Utils::ExperimentParams> paramList;
     // // example params for testing (selected_features_count, num_elems_per_thread, num_iters, num_nodes, num_proj, alternate, verbose)    
-    // std::vector<int> num_node_values = {2, 4, 8, 16, 32, 64}; // Example values for num_nodes
+    // std::vector<int> num_node_values = {64}; // Example values for num_nodes
     // // std::vector<int> num_node_values = {64}; // Example values for num_nodes
     // std::vector<int> num_proj_values = {6}; // Example values for num_proj
     // int num_iters = 3; // Example value for num_iters
@@ -454,7 +466,7 @@ int main (int argc, char* argv[]) {
     // std::vector<int> selected_features_counts = {1}; // Example values for selected_features_count
     // // std::vector<int> selected_features_counts = {1, 2, 4, 8, 16}; // Example values for selected_features_count
     // // std::vector<int> reorder_strategies = {0, 1, 2, 3, 4, 5, 6, 7}; // Example values for reorder_strategy
-    // std::vector<int> reorder_strategies = {0,4,6,7}; // Example values for reorder_strategy
+    // std::vector<int> reorder_strategies = {6}; // Example values for reorder_strategy
     // // 0=none  1=greedy  2=hungarian_reorder  3=column_auction  4=iter_hungarian  5=SA  6=symmetric  7=iter_hungarian+node_reorder
     // for (int reorder_strategy : reorder_strategies) {
     //     for (int selected_features_count : selected_features_counts) {

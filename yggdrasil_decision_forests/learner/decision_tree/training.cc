@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <deque>
 #include <cstdint>
 #include <functional>
@@ -5174,6 +5175,7 @@ absl::Status GrowTreeLocal(
                               cache, std::move(current_node), node_stack));
   }
 
+  internal::PrintAndResetDfsTimers();
   return absl::OkStatus();
 }
 
@@ -5246,8 +5248,36 @@ absl::Status GrowTreeLocalBFS(
                         set_leaf_already_set});
 
 
+  double total_proj_ms = 0.0;
+  double total_split_ms = 0.0;
+  double total_kernel_ms = 0.0;
+  double total_reorder_ms = 0.0;
+  double total_sample_ms = 0.0;
+  double total_flatten_sel_ms = 0.0;
+  double total_flatten_proj_ms = 0.0;
+  double total_malloc_ms = 0.0;
+  double total_h2d_ms = 0.0;
+  double total_d2h_ms = 0.0;
+  double total_free_ms = 0.0;
+
+  UnsignedExampleIdx* pinned_flat_sel = nullptr;
+  cudaMallocHost(&pinned_flat_sel, static_cast<size_t>(num_rows) * sizeof(UnsignedExampleIdx));
+  std::vector<int> node_row_offsets(num_rows + 1);
+
+  float* pinned_projected = nullptr;
+  const size_t pinned_projected_bytes =
+      static_cast<size_t>(num_rows) * max_num_proj * sizeof(float);
+  cudaMallocHost(&pinned_projected, pinned_projected_bytes);
+
+  std::cout << "Starting BFS tree growth..." << std::endl;
+  std::cout << "Max depth: " << dt_config.max_depth() << std::endl;
   while (!node_queue.empty()) {
     const int32_t current_depth = node_queue.front().depth;
+    std::cout << "Processing depth: " << current_depth << ", nodes in queue: " << node_queue.size() << std::endl;
+    if (current_depth >= dt_config.max_depth()) {
+      std::cout << "Reached maximum depth, stopping tree growth." << std::endl;
+      break;
+    }
     std::vector<internal::NodeAndExamples> depth_batch;
     // Not chrono'd: measured at <0.1 s for 3M rows — completely trivial.
     while (!node_queue.empty() &&
@@ -5267,13 +5297,13 @@ absl::Status GrowTreeLocalBFS(
             0.f, 1.f);
 
         const int num_nodes = depth_batch.size();
-        // Sample projections for each node
+
+        // --- [1] Sample projections ---
+        auto t_sample_start = std::chrono::steady_clock::now();
         std::vector<std::vector<internal::Projection>> all_node_projs(
             num_nodes, std::vector<internal::Projection>(num_proj));
         std::vector<std::vector<int8_t>> all_node_mono(
             num_nodes, std::vector<int8_t>(num_proj));
-
-        // Node-major sampling
         for (int n = 0; n < num_nodes; ++n) {
           for (int p = 0; p < num_proj; ++p) {
             internal::SampleProjection(
@@ -5282,23 +5312,44 @@ absl::Status GrowTreeLocalBFS(
                 &all_node_projs[n][p], &all_node_mono[n][p], random);
           }
         }
+        auto t_sample_end = std::chrono::steady_clock::now();
+        double sample_ms = std::chrono::duration<double,std::milli>(t_sample_end - t_sample_start).count();
+        total_sample_ms += sample_ms;
 
+        // --- [2] Reorder projections ---
+        int selected_features_count = 1;
+        auto t_reorder_start = std::chrono::steady_clock::now();
+        internal::ReorderProjections(all_node_projs, num_proj, num_nodes,
+                          selected_features_count,
+                          7, false);
+        auto t_reorder_end = std::chrono::steady_clock::now();
+        double reorder_ms = std::chrono::duration<double,std::milli>(t_reorder_end - t_reorder_start).count();
+        total_reorder_ms += reorder_ms;
+
+        // --- [3] Flatten selected examples ---
+        auto t_flatten_sel_start = std::chrono::steady_clock::now();
         std::vector<absl::Span<const UnsignedExampleIdx>> sel_spans(num_nodes);
-        size_t total_rows = 0; 
+        size_t total_rows = 0;
         for (int n = 0; n < num_nodes; ++n) {
             sel_spans[n] = depth_batch[n].selected_examples.active;
-            total_rows += sel_spans[n].size(); //per depth_batch, total number of selected examples across all nodes
+            total_rows += sel_spans[n].size();
         }
-
-        std::vector<UnsignedExampleIdx> flat_sel(total_rows);
-        std::vector<int> node_row_offsets(num_nodes + 1);
         node_row_offsets[0] = 0;
+        int max_rows_per_node = 0;
         for (int n = 0; n < num_nodes; ++n) {
-            std::copy(sel_spans[n].begin(), sel_spans[n].end(),
-                    flat_sel.begin() + node_row_offsets[n]);
+            const size_t span_bytes = sel_spans[n].size() * sizeof(UnsignedExampleIdx);
+            std::memcpy(pinned_flat_sel + node_row_offsets[n],
+                        sel_spans[n].data(), span_bytes);
             node_row_offsets[n + 1] = node_row_offsets[n] + sel_spans[n].size();
+            max_rows_per_node = std::max(max_rows_per_node,
+                static_cast<int>(sel_spans[n].size()));
         }
+        auto t_flatten_sel_end = std::chrono::steady_clock::now();
+        double flatten_sel_ms = std::chrono::duration<double,std::milli>(t_flatten_sel_end - t_flatten_sel_start).count();
+        total_flatten_sel_ms += flatten_sel_ms;
 
+        // --- [4] Flatten projections ---
+        auto t_flatten_proj_start = std::chrono::steady_clock::now();
         const int num_segments = num_proj * num_nodes;
         std::vector<int> flat_proj_col_idx;
         std::vector<float> flat_proj_weights;
@@ -5314,8 +5365,12 @@ absl::Status GrowTreeLocalBFS(
                     static_cast<int>(flat_proj_col_idx.size());
             }
         }
+        auto t_flatten_proj_end = std::chrono::steady_clock::now();
+        double flatten_proj_ms = std::chrono::duration<double,std::milli>(t_flatten_proj_end - t_flatten_proj_start).count();
+        total_flatten_proj_ms += flatten_proj_ms;
 
-        // Small metadata buffers — vary by depth, cheap to alloc/free.
+        // --- [5] cudaMalloc metadata buffers ---
+        auto t_malloc_start = std::chrono::steady_clock::now();
         int* d_offset = nullptr;
         int* d_flat_projection_col_idx = nullptr;
         float* d_flat_projection_weights = nullptr;
@@ -5324,15 +5379,23 @@ absl::Status GrowTreeLocalBFS(
         cudaMalloc(&d_flat_projection_col_idx, flat_proj_col_idx.size() * sizeof(int));
         cudaMalloc(&d_flat_projection_weights, flat_proj_weights.size() * sizeof(float));
         cudaMalloc(&d_node_row_off, (num_nodes + 1) * sizeof(int));
+        auto t_malloc_end = std::chrono::steady_clock::now();
+        double malloc_ms = std::chrono::duration<double,std::milli>(t_malloc_end - t_malloc_start).count();
+        total_malloc_ms += malloc_ms;
 
-        // d_selected_examples and d_col_add_projected are pre-allocated.
-        cudaMemcpy(d_selected_examples, flat_sel.data(), total_rows * sizeof(int), cudaMemcpyHostToDevice);
+        // --- [6] cudaMemcpy H→D (pinned flat_sel) ---
+        auto t_h2d_start = std::chrono::steady_clock::now();
+        cudaMemcpy(d_selected_examples, pinned_flat_sel, total_rows * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_offset, proj_offsets.data(), (num_segments + 1) * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_flat_projection_col_idx, flat_proj_col_idx.data(), flat_proj_col_idx.size() * sizeof(int), cudaMemcpyHostToDevice);
         cudaMemcpy(d_flat_projection_weights, flat_proj_weights.data(), flat_proj_weights.size() * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_node_row_off, node_row_offsets.data(), (num_nodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
+        auto t_h2d_end = std::chrono::steady_clock::now();
+        double h2d_ms = std::chrono::duration<double,std::milli>(t_h2d_end - t_h2d_start).count();
+        total_h2d_ms += h2d_ms;
 
-        int selected_features_count = 2;
+        // --- [7] Kernel ---
+        auto t_kernel_start = std::chrono::steady_clock::now();
         ColumnAddProjectionKernel_SRDW_1_NP_func(d_flat_data,
                                                  d_selected_examples,
                                                  d_col_add_projected,
@@ -5343,23 +5406,35 @@ absl::Status GrowTreeLocalBFS(
                                                  num_nodes,
                                                  num_proj,
                                                  num_rows,
-                                                 selected_features_count);
-        cudaDeviceSynchronize();
+                                                 selected_features_count,
+                                                 max_rows_per_node);
+        auto t_kernel_end = std::chrono::steady_clock::now();
+        double kernel_ms = std::chrono::duration<double,std::milli>(t_kernel_end - t_kernel_start).count();
+        total_kernel_ms += kernel_ms;
 
-        // Single bulk copy back instead of per-node copies.
-        std::vector<float> projected_all(total_rows * num_proj);
-        cudaMemcpy(projected_all.data(), d_col_add_projected,
-                   total_rows * num_proj * sizeof(float),
-                   cudaMemcpyDeviceToHost);
+        // --- [8] cudaMemcpy D→H (pinned) ---
+        auto t_d2h_start = std::chrono::steady_clock::now();
+        const size_t d2h_bytes = total_rows * num_proj * sizeof(float);
+        cudaMemcpy(pinned_projected, d_col_add_projected,
+                   d2h_bytes, cudaMemcpyDeviceToHost);
+        auto t_d2h_end = std::chrono::steady_clock::now();
+        double d2h_ms = std::chrono::duration<double,std::milli>(t_d2h_end - t_d2h_start).count();
+        total_d2h_ms += d2h_ms;
 
+        // --- [9] cudaFree metadata buffers ---
+        auto t_free_start_iter = std::chrono::steady_clock::now();
         cudaFree(d_offset);
         cudaFree(d_flat_projection_col_idx);
         cudaFree(d_flat_projection_weights);
         cudaFree(d_node_row_off);
+        auto t_free_end_iter = std::chrono::steady_clock::now();
+        double free_ms = std::chrono::duration<double,std::milli>(t_free_end_iter - t_free_start_iter).count();
+        total_free_ms += free_ms;
 
         auto t_proj_end = std::chrono::steady_clock::now();
-        auto t_split_start = std::chrono::steady_clock::now();
 
+        // --- [10] Split finding ---
+        auto t_split_start = std::chrono::steady_clock::now();
         size_t gpu_offset = 0;
         for (int n = 0; n < num_nodes; ++n) {
           const size_t slab = num_proj * sel_spans[n].size();
@@ -5367,7 +5442,7 @@ absl::Status GrowTreeLocalBFS(
           node_config.depthwise_projection_defs = &all_node_projs[n];
           node_config.depthwise_monotonic = &all_node_mono[n];
           node_config.precomputed_projected_values =
-              absl::MakeConstSpan(projected_all.data() + gpu_offset, slab);
+              absl::MakeConstSpan(pinned_projected + gpu_offset, slab);
           RETURN_IF_ERROR(NodeTrain(train_dataset, config, config_link, dt_config,
                                     deployment, weights, node_config, random,
                                     cache, std::move(depth_batch[n]),
@@ -5375,11 +5450,24 @@ absl::Status GrowTreeLocalBFS(
           gpu_offset += slab;
         }
         auto t_split_end = std::chrono::steady_clock::now();
+        double proj_ms = std::chrono::duration<double,std::milli>(t_proj_end - t_proj_start).count();
+        double split_ms = std::chrono::duration<double,std::milli>(t_split_end - t_split_start).count();
+        total_proj_ms += proj_ms;
+        total_split_ms += split_ms;
         std::cerr << "D" << current_depth
                   << " nodes=" << num_nodes
                   << " rows=" << total_rows
-                  << " proj=" << std::chrono::duration<double,std::milli>(t_proj_end - t_proj_start).count() << "ms"
-                  << " split=" << std::chrono::duration<double,std::milli>(t_split_end - t_split_start).count() << "ms"
+                  << " sample=" << sample_ms << "ms"
+                  << " reorder=" << reorder_ms << "ms"
+                  << " flat_sel=" << flatten_sel_ms << "ms"
+                  << " flat_proj=" << flatten_proj_ms << "ms"
+                  << " malloc=" << malloc_ms << "ms"
+                  << " h2d=" << h2d_ms << "ms"
+                  << " kernel=" << kernel_ms << "ms"
+                  << " d2h=" << d2h_ms << "ms"
+                  << " free=" << free_ms << "ms"
+                  << " proj_total=" << proj_ms << "ms"
+                  << " split=" << split_ms << "ms"
                   << "\n";
     } else
 #elif defined(SYMMETRIC_DEPTHWISE_AP)
@@ -5602,10 +5690,30 @@ absl::Status GrowTreeLocalBFS(
       }
     }
   }
+  internal::PrintAndResetDfsTimers();
+  std::cerr << "TOTAL"
+            << " sample=" << total_sample_ms << "ms"
+            << " reorder=" << total_reorder_ms << "ms"
+            << " flat_sel=" << total_flatten_sel_ms << "ms"
+            << " flat_proj=" << total_flatten_proj_ms << "ms"
+            << " malloc=" << total_malloc_ms << "ms"
+            << " h2d=" << total_h2d_ms << "ms"
+            << " kernel=" << total_kernel_ms << "ms"
+            << " d2h=" << total_d2h_ms << "ms"
+            << " free=" << total_free_ms << "ms"
+            << " proj_total=" << total_proj_ms << "ms"
+            << " split=" << total_split_ms << "ms\n";
+  auto t_free_start = std::chrono::steady_clock::now();
+  cudaFreeHost(pinned_flat_sel);
+  cudaFreeHost(pinned_projected);
   cudaFree(d_selected_examples);
   cudaFree(d_col_add_projected);
   cudaFree(d_flat_data);
   cudaFree(d_labels);
+  auto t_free_end = std::chrono::steady_clock::now();
+  std::cerr << "CLEANUP free="
+            << std::chrono::duration<double,std::milli>(t_free_end - t_free_start).count()
+            << "ms\n";
   return absl::OkStatus();
 }
 

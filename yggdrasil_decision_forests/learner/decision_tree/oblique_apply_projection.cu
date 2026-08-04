@@ -81,11 +81,11 @@ void ColumnAddProjectionKernel_SRDW_1_NP_func(
     int num_nodes,
     int num_proj,
     int num_rows,
-    int selected_features_count) {
+    int selected_features_count,
+    int max_rows_per_node) {
 
     constexpr int BLOCK = 256;
-    int max_rows = num_rows;
-    int blocks_per_node = (max_rows + BLOCK - 1) / BLOCK;
+    int blocks_per_node = (max_rows_per_node + BLOCK - 1) / BLOCK;
     dim3 grid(blocks_per_node, num_nodes, num_proj);
 
     ColumnAddProjectionKernel_SRDW_1<BLOCK><<<grid, BLOCK>>>(

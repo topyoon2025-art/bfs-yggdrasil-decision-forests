@@ -42,6 +42,11 @@ cuda_library(
 )
 
 cc_library_ydf(
+    name = "maximize_groupings",
+    hdrs = ["maximize_groupings.h"],
+)
+
+cc_library_ydf(
     name = "training",
     srcs = [
         "oblique.cc",
@@ -59,6 +64,7 @@ cc_library_ydf(
         "vector_sequence.h",
     ],
     deps = [
+        ":maximize_groupings",
         ":oblique_apply_projection", #ADDED BY JY
         ":decision_tree_cc_proto",
         ":gpu",

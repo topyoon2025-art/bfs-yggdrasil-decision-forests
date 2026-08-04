@@ -20,7 +20,7 @@ void cuda_warmup();
 
 void ColumnAddProjectionKernel_SRDW_1_NP_func(
     const float* d_flat_data,
-    int* d_selected_examples,//selected examples indices
+    int* d_selected_examples,
     float* d_col_add_projected,
     const int* d_offset,
     const int* d_flat_projection_col_idx,
@@ -29,7 +29,8 @@ void ColumnAddProjectionKernel_SRDW_1_NP_func(
     int num_nodes,
     int num_proj,
     int num_rows,
-    int selected_features_count);
+    int selected_features_count,
+    int max_rows_per_node);
 
 void ApplyProjectionBaseline (const float* d_flat_data,
                               int* d_selected_examples,//selected examples indices

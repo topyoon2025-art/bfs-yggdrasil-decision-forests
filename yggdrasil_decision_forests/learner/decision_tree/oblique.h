@@ -309,6 +309,13 @@ absl::Status SetCondition(const Projection& projection, float threshold,
                           const dataset::proto::DataSpecification& dataspec,
                           proto::NodeCondition* condition);
 
+void ReorderProjections(
+    std::vector<std::vector<Projection>>& all_node_projs,
+    int num_proj, int num_nodes, int selected_features_count,
+    int reorder_strategy, bool verbose);
+
+void PrintAndResetDfsTimers();
+
 }  // namespace internal
 }  // namespace decision_tree
 }  // namespace model

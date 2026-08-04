@@ -71,7 +71,7 @@ cc_binary(
 cc_binary(
     name = "oblique_apply_projection_main",
     #MODIFIED BY JY
-    srcs = ["oblique_apply_projection_main.cc", "parallel_utils.hpp", "maximize_groupings.hpp"],
+    srcs = ["oblique_apply_projection_main.cc", "parallel_utils.hpp"],
     
     # linkopts = ["-pg"],
     # features = ["c++17"],
@@ -86,6 +86,7 @@ cc_binary(
         "//yggdrasil_decision_forests/learner/random_forest:random_forest",
         "//yggdrasil_decision_forests/learner/gradient_boosted_trees",
         "//yggdrasil_decision_forests/learner:learner_library",
+        "//yggdrasil_decision_forests/learner/decision_tree:maximize_groupings",
         "//yggdrasil_decision_forests/learner/decision_tree:training",
         "//yggdrasil_decision_forests/model/random_forest:random_forest",
         "//yggdrasil_decision_forests/model:model_library",
